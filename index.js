@@ -6,6 +6,7 @@
 /* eslint-disable no-useless-escape */
 import { combineRgb, Regex, TCPHelper } from '@companion-module/base'
 import * as net from 'net'
+import dgram from 'node:dgram';
 import { runEntrypoint, InstanceBase, InstanceStatus } from '@companion-module/base'
 import { SerialPort } from 'serialport'
 
@@ -23,7 +24,7 @@ const toHex = (data, delim = '') => {
 	return [...data]
 		.map((hex) => {
 			return ('0' + Number(hex.charCodeAt(0)).toString(16)).slice(-2)
-		})
+		}) 
 		.join(delim)
 }
 
@@ -56,6 +57,7 @@ class TSPInstance extends InstanceBase {
 		this.sPortPath = 'none'
 		this.isOpen = false
 		this.IPPort = 32100
+		this.UDPPort = 32101
 	}
 
 	/**
@@ -123,7 +125,9 @@ class TSPInstance extends InstanceBase {
 		this.config = config
 		this.clearAll()
 		this.isListening = false
+		this.udpListening = false
 		this.IPPort = config.iport || 32100
+		this.UDPPort = config.udpport || (parseInt(this.IPPort) + 1)
 		this.sPortPath = config.sport || 'none'
 		this.tSockets = []
 		this.isOpen = false
@@ -168,7 +172,10 @@ class TSPInstance extends InstanceBase {
 
 		this.sPort.on('error', this.doUpdateStatus.bind(this))
 
-		this.sPort.on('open', this.init_tcp.bind(this))
+		this.sPort.on('open', () => {
+			this.init_tcp()
+			this.init_udp()
+		});
 
 		this.sPort.on('close', (err) => {
 			this.doUpdateStatus(err)
@@ -182,10 +189,13 @@ class TSPInstance extends InstanceBase {
 
 		this.sPort.on('data', (data) => {
 			// make sure client is connected
+			//this.log('debug','COM> ' + toHex(data.toString('latin1') + ' '))
 			if (this.tSockets.length > 0) {
 				// forward data to the TCP connection (data is a buffer)
-				this.log('debug','COM> ' + toHex(data.toString('latin1') + ' '))
 				this.tSockets.forEach((sock) => sock.write(data))
+			}
+			if(this.udpListening && this.uClient) {
+				this.uServer.send(data, this.uClient.port, this.uClient.address);
 			}
 			clearInterval(this.SERIAL_INTERVAL)
 		})
@@ -250,6 +260,37 @@ class TSPInstance extends InstanceBase {
 		this.doUpdateStatus()
 	}
 
+	init_udp() {
+
+		let uServer = dgram.createSocket('udp4');
+
+		uServer.on('error', (err) => {
+			this.doUpdateStatus(err)
+		});
+
+		uServer.on('close', () => {
+			this.uServer = undefined;
+			this.udpListening = false;
+			this.updateVariables()
+		})
+
+		uServer.on('message', (data, rinfo) => {
+			this.uClient = rinfo;
+			// forward data to the serial port
+			this.log('debug','UDP: ' + toHex(data.toString('latin1') + ' '))
+			this.sPort.write(data)
+			if (this.config.response == true) {
+				this.SERIAL_INTERVAL = setTimeout(this.sendError.bind(this), this.config.maxresponse)
+			}
+		});
+
+		uServer.bind(this.UDPPort);
+
+		this.udpListening = true;
+		this.uServer = uServer;
+		this.doUpdateStatus();
+	}
+
 	/**
 	 * Send an error to all TCP sockets if no response was receieved on the Serial Port
 	 * @since 1.0.7
@@ -280,10 +321,10 @@ class TSPInstance extends InstanceBase {
 		let l
 		let m
 
-		if (this.isListening) {
+		if (this.isListening || this.udpListening) {
 			l = 'info'
 			s = InstanceStatus.Ok
-			m = `Listening on TCP port ${this.IPPort}`
+			m = `Listening on TCP port ${this.IPPort}, UDP: ${this.UDPPort}`
 		} else if (err) {
 			l = 'error'
 			s = InstanceStatus.Error
@@ -479,6 +520,15 @@ class TSPInstance extends InstanceBase {
 				tooltip: 'Enter the IP Port to listen for TCP connections on this computer',
 				width: 8,
 				default: this.IPPort,
+				regex: Regex.PORT,
+			},
+			{
+				type: 'textinput',
+				id: 'udpport',
+				label: 'UDP Listen Port',
+				tooltip: 'Enter the IP Port to listen for UDP connections on this computer',
+				width: 8,
+				default: this.UDPPort,
 				regex: Regex.PORT,
 			},
 		]
